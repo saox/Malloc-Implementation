@@ -1,0 +1,18 @@
+To run the main program enter the folder PROGRAM. Run the command:
+make
+
+All old files will be removed, the c files will be compiled and the program will run all tests. 
+IMPORTANT: This program is created and run on a linux computer. 
+
+For changing the algorithm stratedy, go into the makefile and change the value of the variable DSTRATEGY to:
+1 for first_fit
+2 for best_fit
+3 for worst_fit
+4 for quick_fit
+
+
+To run our own tests go into the folder TIME or MEMORY. Set DSTRATEGY to the desired value and run the command:
+make 1
+
+… And the edited test versions of tstalgorithms will run and print the results.
+

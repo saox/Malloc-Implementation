@@ -1,0 +1,384 @@
+#define _GNU_SOURCE
+
+#include "brk.h"
+#include <unistd.h>
+#include <string.h> 
+#include <errno.h> 
+#include <sys/mman.h>
+#include "malloc.h"
+#include "tst.h"
+
+#define NALLOC 1024                                     /* minimum #units to request */
+
+#define FIRST_FIT	1									/* define different strategy   */
+#define BEST_FIT 	2
+#define WORST_FIT	3
+#define QUICK_FIT	4
+
+
+#define QF_INCREASEFACTOR 1;				/* Number of blocks to expand quickfit list */
+
+#ifndef NRQUICKLISTS
+#define NRQUICKLISTS 5
+#endif
+
+#ifndef STRATEGY
+#define STRATEGY FIRST_FIT
+#endif
+
+typedef long Align;                                     /* for alignment to long boundary */
+
+union header {                                          /* block header */
+  struct {
+    union header *ptr;                                  /* next block if on free list */
+    unsigned size;                                      /* size of this block  - what unit? */ 
+  } s;
+  Align x;                                              /* force alignment of blocks */
+};
+
+typedef union header Header;
+
+static Header base;                                     /* empty list to get started */
+static Header *freep = NULL;                            /* start of free list */
+
+#if STRATEGY == QUICK_FIT								/* Variable and list for quic_fit */
+	Header * qList[NRQUICKLISTS] = {NULL};
+	int minQuickList = sizeof(Header);
+#endif
+
+/* free: put block ap in the free list */
+
+void free(void * ap)
+{
+  Header *bp, *p;
+
+  if(ap == NULL) return;                                /* Nothing to do */
+
+  bp = (Header *) ap - 1;                               /* point to block header */
+  
+#if STRATEGY == QUICK_FIT
+	int index = getQuickListIdx(bp->s.size);			/* Return element to a quicklist */
+	
+	if(index != -1){
+		bp->s.ptr = qList[index];
+		qList[index] = bp;
+		return;
+	}		
+#endif
+  
+  for(p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
+    if(p >= p->s.ptr && (bp > p || bp < p->s.ptr))
+      break;                                            /* freed block at atrt or end of arena */
+
+  if(bp + bp->s.size == p->s.ptr) {                     /* join to upper nb */
+    bp->s.size += p->s.ptr->s.size;
+    bp->s.ptr = p->s.ptr->s.ptr;
+  }
+  else
+    bp->s.ptr = p->s.ptr;
+  if(p + p->s.size == bp) {                             /* join to lower nbr */
+    p->s.size += bp->s.size;
+    p->s.ptr = bp->s.ptr;
+  } else
+    p->s.ptr = bp;
+  freep = p;
+}
+
+/* morecore: ask system for more memory */
+
+#ifdef MMAP
+
+static void * __endHeap = 0;
+
+void * endHeap(void)
+{
+/* The if */
+  if(__endHeap == 0) __endHeap = sbrk(0);
+  return __endHeap;
+}
+#endif
+
+static Header *morecore(unsigned nu)
+{
+  void *cp;
+  Header *up;
+#ifdef MMAP
+  unsigned noPages;
+  /* sbrk returns the program break. This could be done by calling the endHeap function
+  above */
+  if(__endHeap == 0) __endHeap = sbrk(0);
+#endif
+
+  if(nu < NALLOC)
+    nu = NALLOC;
+#ifdef MMAP
+  noPages = ((nu*sizeof(Header))-1)/getpagesize() + 1;
+  cp = mmap(__endHeap, noPages*getpagesize(), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  nu = (noPages*getpagesize())/sizeof(Header);
+  __endHeap += noPages*getpagesize();
+#else
+  cp = sbrk(nu*sizeof(Header));
+#endif
+  if(cp == (void *) -1){                                 /* no space at all */
+    perror("failed to get more memory");
+    return NULL;
+  }
+  up = (Header *) cp;
+  up->s.size = nu;
+  free((void *)(up+1));
+  return freep;
+}
+
+
+void * returnblock(Header *ptr, Header *prevp, unsigned nunits){
+	
+	if (ptr->s.size == nunits)                          /* exactly */
+			prevp->s.ptr = ptr->s.ptr;
+      	else {                                            /* allocate tail end */
+			ptr->s.size -= nunits;
+			ptr += ptr->s.size;
+			ptr->s.size = nunits;
+      }
+      freep = prevp;
+      return (void *)(ptr+1);
+	
+}
+
+void * first_fit(size_t nunits){
+
+	/* p is header pointer, and prevp is the previous pointer */
+  Header *p, *prevp;
+  
+  /* set the pree pointer to the free pointer */
+  
+  prevp = freep;
+	  
+  for(p= prevp->s.ptr;  ; prevp = p, p = p->s.ptr) {
+    if(p->s.size >= nunits) {                           /* big enough */
+      return returnblock(p,prevp,nunits);
+    }
+
+    if(p == freep)                                      /* wrapped around free list */
+      if((p = morecore(nunits)) == NULL)			/* none left */
+		return NULL;                       
+			             
+  }
+
+}
+
+void * best_fit(size_t nunits){
+	Header *p, *prevp, *smallest, *smallestprev;
+	
+	smallest = NULL;
+	
+	prevp = freep;	
+	p = prevp->s.ptr;
+	
+	for(; ; prevp = p, p = p->s.ptr) {
+
+		/* give the smallest element to the variable "smallest" */
+		if( p->s.size >= nunits){
+		
+			if(NULL == smallest || p->s.size < smallest->s.size){
+				smallest = p;
+				smallestprev = prevp;
+			}
+			
+    	}
+    
+   	 /* wrapped around free list */
+   		 if(p == freep){
+   		 	/* check if smallest is small enough, else give more core */	
+   		 	if(NULL != smallest)                            /* big enough */
+   		 	      return returnblock(smallest,smallestprev,nunits);		
+    		 else 
+    			if((p = morecore(nunits)) == NULL)
+					return NULL; 
+    		
+   		 }
+
+	}
+	
+}
+
+void * worst_fit(size_t nunits){
+	Header *p, *prevp, *biggest, *biggestprev;
+	
+	biggestprev = prevp = freep;	
+	biggest = p = prevp->s.ptr;
+	
+	for(; ; prevp = p, p = p->s.ptr) {
+		
+		/* give the biggest element to the variable "biggest" */
+		if(p->s.size > biggest->s.size){
+			biggest = p;
+			biggestprev = prevp;
+    	}
+    
+   	 /* wrapped around free list */
+   		 if(p == freep){
+
+   		 	/* check if biggest is big enough, else give more core */	
+   		 	if(biggest->s.size >= nunits)                            /* big enough */
+   		 	      return returnblock(biggest,biggestprev,nunits);		
+    		 else 
+    			if((p = morecore(nunits)) == NULL)
+					return NULL; 
+    		
+   		 }
+
+	}	
+}
+
+#if STRATEGY == QUICK_FIT
+/* Returns the head of the expanded list */
+Header * expandList(size_t listSize, size_t blocksize, size_t oneunit){
+		/* Header pointers */
+		Header * ptr, * prevPtr, *head;  	
+
+	/* Number of bytes */
+		size_t nbytes = blocksize * QF_INCREASEFACTOR;
+		
+	/* Number of units */
+		size_t nunits = nbytes / sizeof(Header);
+
+	/* Void-pointer is returned from first_fit. 
+	1 is subtracted to reach the Header of that unit, to point att the memory allocation 	*/
+
+ 	head = (Header *) first_fit(nunits) - 1;
+ 	
+
+  	/* Now nbytes has been freed and is allocated to head, devide into a qList */  		
+	ptr = prevPtr = head;	/* point to the first header */
+	
+	ptr->s.size = oneunit;		/* set size in nunits */
+	ptr->s.ptr = NULL;			/* set pointer to NULL */
+	
+	
+		/* loop through, and set, every blocksize to contain a header and free memory */
+	int i;
+	for (i = blocksize; i < nbytes; i += blocksize) {
+		/* increment the pointer one unit */
+		ptr += oneunit;
+
+
+		ptr->s.size = oneunit;		/* set size in nunits */
+		ptr->s.ptr = NULL;			/* set pointer to NULL */
+		
+		prevPtr -> s.ptr = ptr;		/* redirect previous pointer */
+		prevPtr = ptr;
+	}
+	
+	/* return the head */
+  	return head;
+}
+
+/* return index of the quicklist that corresponds to the size, or -1 if it's too big */
+int getQuickListIdx(size_t nunits){
+
+	/* Initial listSize sizeof(Header), 
+	bytesize is number of bytes excluding the header */
+	
+	size_t listSize = minQuickList, i, bytesize = (nunits-1)*sizeof(Header);
+
+	for(i=0; i < NRQUICKLISTS ; i++){
+		if(bytesize <= listSize*(1<<i))
+			return i;
+	}
+	
+	/* Return -1 to indicate that no quickfit list were big enough */
+	return -1;
+
+}
+
+void * quick_fit(size_t nunits){
+
+	/* nunits is the input, index for the appropriate list is returned */
+	int index = getQuickListIdx(nunits);
+	if(index == -1)
+		return first_fit(nunits);
+	
+	/* If this list points to NULL it needs to be expanded */
+	if(qList[index] == NULL){
+		size_t listSize =  minQuickList * (1<<index);	/* elementsize for list */
+		size_t blocksize = listSize + sizeof(Header);	/* blocksize for list */
+		size_t oneunit = blocksize/sizeof(Header);		/* just like nunits, but for one headerunit */
+
+		qList[index] = expandList(listSize, blocksize, oneunit);
+
+	}
+
+	Header *ptr = qList[index];
+	
+	
+	qList[index] = qList[index]->s.ptr;
+	
+	/* the pointer is increased one "Header-step" so it points to the actual data */
+	return (void *)(ptr+1);
+
+}
+
+#endif
+
+void * malloc(size_t nbytes)
+{
+  
+   /*  */
+  Header * morecore(unsigned);
+  unsigned nunits;
+
+  if(nbytes == 0) return NULL;
+
+  nunits = (nbytes+sizeof(Header)-1)/sizeof(Header) +1;
+
+  if(freep == NULL) {
+    base.s.ptr = freep = &base;
+    base.s.size = 0;
+  }
+  
+  
+  #if STRATEGY == FIRST_FIT
+  	return first_fit(nunits);
+  #elif STRATEGY == BEST_FIT
+  	return best_fit(nunits);
+  #elif STRATEGY == WORST_FIT
+  	return worst_fit(nunits);
+  #elif STRATEGY == QUICK_FIT
+  	/* Important: In quick fit, nunits is not send in! In this algorithm number of bytes is sent in */
+  	return quick_fit(nunits);
+  #endif
+  	
+
+}
+
+/* The realloc function changes the size of the memory block pointed to by ptr to size bytes. */
+void *realloc(void *ptr, size_t new_size)
+{
+
+	if(ptr == NULL){
+		return malloc(new_size);
+	}
+		
+	/* If pointer is NOT Null and new_size == 0 this code is executed */
+	if(new_size == 0){
+		free(ptr);
+		return NULL;
+	}
+	
+	Header *header;
+	size_t old_size;
+	void *new_ptr;
+	
+	header = (Header *)ptr - 1;
+	old_size = (header->s.size-1)*sizeof(Header);
+	new_ptr = malloc(new_size);
+	
+	if (new_size < old_size)
+      old_size = new_size;
+      
+    memcpy(new_ptr, ptr, old_size);
+    
+    free(ptr);
+		
+	return new_ptr;
+}
